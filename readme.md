@@ -1,12 +1,12 @@
-## install Yang diperlukan ##
+## Install Yang diperlukan ##
 
 pip3 install ultralytics opencv-python-headless flask ffmpeg-python
 
-## menjalankan code ##
+## Menjalankan code ##
 
 python app.py
 
-## membuat docker ##
+## Membuat docker ##
 
 docker build -t vehicle_detection_app .
 
