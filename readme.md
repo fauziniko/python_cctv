@@ -1,3 +1,5 @@
+## install Yang diperlukan ##
+
 pip3 install ultralytics opencv-python-headless flask ffmpeg-python
 
 ## menjalankan code ##
