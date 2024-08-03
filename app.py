@@ -6,54 +6,118 @@ import threading
 import time
 import numpy as np
 import uuid
+import mysql.connector
+from collections import defaultdict
 
 app = Flask(__name__)
 
 # Load YOLO model with GPU support
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
-model = YOLO('yolov8x.pt').to(device)
+
+model = YOLO('yolov8n.pt').to(device)
 print(f"Model loaded on device: {device}")
 
-# Initialize vehicle ID counter, detected vehicles, and person counts
 vehicle_id = 0
 detected_vehicles = {}
 last_positions = {}
 temporary_person_counts = 0
-last_person_positions = {}
+last_person_positions = defaultdict(lambda: (0, 0))
 
-# Temporary storage for vehicle counts and total count
 vehicle_counts_storage = {'car': 0, 'motorcycle': 0, 'bus': 0, 'truck': 0}
 total_count_storage = 0
 
-# Counting line position (default)
-line_position = {'y': 500}
+line_position = {'y': 50}  # Move y-line inside the smaller box
 
-# Global variable to store the latest monitoring data
 monitoring_data = {
     'vehicle_counts': vehicle_counts_storage,
     'total_count': total_count_storage,
     'person_count': temporary_person_counts
 }
 
-# Store monitoring codes with their corresponding data
 monitoring_codes_data = {}
 
-# Function to count vehicles and persons, and draw bounding boxes with IDs
-def count_objects(frame, model):
+db_config = {
+    'user': 'root',
+    'password': '',
+    'host': 'localhost',
+    'database': 'monitoring_db'
+}
+
+def create_monitoring_table(monitoring_code):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    
+    table_name = f"monitoring_data_{monitoring_code}"
+    
+    query = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        id INT PRIMARY KEY,
+        car_count INT DEFAULT 0,
+        motorcycle_count INT DEFAULT 0,
+        bus_count INT DEFAULT 0,
+        truck_count INT DEFAULT 0,
+        total_vehicle_count INT DEFAULT 0,
+        person_count INT DEFAULT 0,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+    """
+    
+    cursor.execute(query)
+    cursor.execute(f"INSERT IGNORE INTO {table_name} (id) VALUES (1)")
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def save_monitoring_data_to_db(monitoring_code, vehicle_counts, total_count, person_count):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    
+    table_name = f"monitoring_data_{monitoring_code}"
+    
+    query = f"""
+    UPDATE {table_name} SET
+        car_count = %s,
+        motorcycle_count = %s,
+        bus_count = %s,
+        truck_count = %s,
+        total_vehicle_count = %s,
+        person_count = %s
+    WHERE id = 1
+    """
+    
+    cursor.execute(query, (
+        vehicle_counts['car'], 
+        vehicle_counts['motorcycle'], 
+        vehicle_counts['bus'], 
+        vehicle_counts['truck'], 
+        total_count, 
+        person_count
+    ))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def count_objects(frame, model, monitoring_code):
     global vehicle_id, total_count_storage, temporary_person_counts, monitoring_data
     results = model(frame)
     current_vehicles = {}
     current_persons = {}
-    detection_threshold = 50  # Distance threshold for matching vehicles/persons
+    detection_threshold = 50
+
+    frame_height, frame_width = frame.shape[:2]
+    box_x1, box_y1 = int(frame_width * 0.1), int(frame_height * 0.1)
+    box_x2, box_y2 = int(frame_width * 0.9), int(frame_height * 0.9)
+    line_position_y = box_y1 + int((box_y2 - box_y1) / 2)  # Move y-line inside the smaller box
 
     for result in results:
         for box in result.boxes:
             class_id = int(box.cls)
             label = None
 
-            # Detect vehicles
-            if class_id in [2, 3, 5, 7]:  # Car, Motorcycle, Bus, Truck
+            if class_id in [2, 3, 5, 7]:
                 if class_id == 2:
                     label = 'Car'
                 elif class_id == 3:
@@ -66,132 +130,135 @@ def count_objects(frame, model):
                 x1, y1, x2, y2 = box.xyxy[0]
                 vehicle_center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-                found = False
-                vid = None
-                for vid, vcenter in detected_vehicles.items():
-                    distance = np.linalg.norm(np.array(vehicle_center) - np.array(vcenter))
-                    if distance < detection_threshold:  # Same vehicle
+                if box_x1 < vehicle_center[0] < box_x2 and box_y1 < vehicle_center[1] < box_y2:
+                    found = False
+                    vid = None
+                    for vid, vcenter in detected_vehicles.items():
+                        distance = np.linalg.norm(np.array(vehicle_center) - np.array(vcenter))
+                        if distance < detection_threshold:
+                            current_vehicles[vid] = vehicle_center
+                            found = True
+                            break
+
+                    if not found:
+                        vehicle_id += 1
+                        vid = vehicle_id
                         current_vehicles[vid] = vehicle_center
-                        found = True
-                        break
+                        last_positions[vid] = vehicle_center
 
-                if not found:
-                    vehicle_id += 1
-                    vid = vehicle_id
-                    current_vehicles[vid] = vehicle_center
-                    last_positions[vid] = vehicle_center
+                    if vid is not None and last_positions[vid][1] < line_position_y and vehicle_center[1] >= line_position_y:
+                        vehicle_counts_storage[label.lower()] += 1
+                        total_count_storage += 1
 
-                if vid is not None and last_positions[vid][1] < line_position['y'] and vehicle_center[1] >= line_position['y']:
-                    vehicle_counts_storage[label.lower()] += 1
-                    total_count_storage += 1
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+                    cv2.putText(frame, f'{label}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 0), 2)
 
-                # Draw bounding box with vehicle label (without ID)
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-                cv2.putText(frame, f'{label}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 0), 2)
-
-            # Detect persons
-            elif class_id == 0:  # Assuming class ID 0 corresponds to persons
+            elif class_id == 0:
                 x1, y1, x2, y2 = box.xyxy[0]
                 person_center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-                found = False
-                pid = None
-                for pid, pcenter in last_person_positions.items():
-                    distance = np.linalg.norm(np.array(person_center) - np.array(pcenter))
-                    if distance < detection_threshold:  # Same person
+                if box_x1 < person_center[0] < box_x2 and box_y1 < person_center[1] < box_y2:
+                    found = False
+                    pid = None
+                    for pid, pcenter in last_person_positions.items():
+                        distance = np.linalg.norm(np.array(person_center) - np.array(pcenter))
+                        if distance < detection_threshold:
+                            current_persons[pid] = person_center
+                            found = True
+                            break
+
+                    if not found:
+                        pid = len(last_person_positions) + 1
                         current_persons[pid] = person_center
-                        found = True
-                        break
+                        last_person_positions[pid] = person_center
 
-                if not found:
-                    pid = len(last_person_positions) + 1  # Assign a new ID
-                    current_persons[pid] = person_center
-                    last_person_positions[pid] = person_center
+                    if pid is not None and last_positions[pid][1] < line_position_y and person_center[1] >= line_position_y:
+                        temporary_person_counts += 1
 
-                # Check if the person crosses the line
-                if pid is not None and last_person_positions[pid][1] < line_position['y'] and person_center[1] >= line_position['y']:
-                    temporary_person_counts += 1  # Count the person
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                    cv2.putText(frame, 'Person', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-                # Draw bounding box for persons
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.putText(frame, 'Person', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-
-    # Update detected vehicles and their last positions
     detected_vehicles.update(current_vehicles)
     for vid in current_vehicles.keys():
         last_positions[vid] = current_vehicles[vid]
 
-    # Update last positions for persons
     last_person_positions.update(current_persons)
 
-    # Update monitoring data
     monitoring_data = {
         'vehicle_counts': vehicle_counts_storage,
         'total_count': total_count_storage,
         'person_count': temporary_person_counts
     }
 
+    save_monitoring_data_to_db(monitoring_code, vehicle_counts_storage, total_count_storage, temporary_person_counts)
+
     return vehicle_counts_storage, total_count_storage, temporary_person_counts
 
 class VideoCamera:
     def __init__(self, rtsp_url=''):
         self.rtsp_url = rtsp_url
-        self.cap = None
+        self.capture = None
         self.frame = None
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.update, args=())
         self.thread.daemon = True
         self.thread.start()
+        self.set_rtsp_url(rtsp_url)
 
     def __del__(self):
-        if self.cap:
-            self.cap.release()
+        if self.capture:
+            self.capture.release()
 
     def get_frame(self):
         with self.lock:
-            return self.frame.copy() if self.frame is not None else None
+            if self.frame is not None:
+                return self.frame.copy()
+            else:
+                return None
 
     def set_rtsp_url(self, rtsp_url):
         with self.lock:
             self.rtsp_url = rtsp_url
-            if self.cap:
-                self.cap.release()
-            self.cap = cv2.VideoCapture(rtsp_url)
-            if not self.cap.isOpened():
-                print("Error: Unable to open video stream.")
-                self.cap = None
-                return None
-            else:
-                return generate_monitoring_code()  # Return monitoring_code after successfully setting RTSP URL
+            if self.capture:
+                self.capture.release()
+            self.capture = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            if not self.capture.isOpened():
+                print(f"Error: Unable to open video stream at {rtsp_url}.")
+                return False
+            print(f"Video stream opened successfully at {rtsp_url}.")
+            return True
 
     def update(self):
         while True:
-            if self.cap:
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("Error: Unable to read frame.")
+            if self.capture:
+                ret, frame = self.capture.read()
+                if ret:
+                    with self.lock:
+                        self.frame = frame
+                else:
+                    print("Error: Unable to read frame. Retrying...")
                     time.sleep(1)
-                    continue
-                with self.lock:
-                    self.frame = frame
+                    self.capture.release()
+                    self.capture = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             else:
                 time.sleep(0.01)
 
 camera = VideoCamera()
 
 def generate_monitoring_code():
-    # Generate monitoring code using first 8 characters of UUID
     monitoring_code = str(uuid.uuid4())[:8]
-    monitoring_codes_data[monitoring_code] = monitoring_data  # Store initial data
+    monitoring_codes_data[monitoring_code] = {
+        'vehicle_counts': {'car': 0, 'motorcycle': 0, 'bus': 0, 'truck': 0},
+        'total_count': 0,
+        'person_count': 0,
+        'line_position': line_position['y']
+    }
+    create_monitoring_table(monitoring_code)
     return monitoring_code
 
-def generate_frames():
-    frame_count = 0
-    process_interval = 1  # frame rate
-    fps = 30
+def generate_frames(monitoring_code):
+    fps = 25  
     sleep_interval = 1 / fps
-
-    last_processed_frame = None
 
     while True:
         start_time = time.time()
@@ -200,39 +267,39 @@ def generate_frames():
             time.sleep(0.01)
             continue
 
-        frame_count += 1
+        vehicle_counts, total_count, persons = count_objects(frame, model, monitoring_code)
 
-        if frame_count % process_interval == 0:
-            vehicle_counts, total_count, persons = count_objects(frame, model)
+        frame_height, frame_width = frame.shape[:2]
+        box_x1, box_y1 = int(frame_width * 0.1), int(frame_height * 0.1)
+        box_x2, box_y2 = int(frame_width * 0.9), int(frame_height * 0.9)
+        line_position_y = box_y1 + int((box_y2 - box_y1) / 2)
 
-            # Draw the counting line
-            cv2.line(frame, (0, line_position['y']), (frame.shape[1], line_position['y']), (0, 255, 255), 2)
+        # Draw smaller box
+        cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 2)
+        cv2.line(frame, (box_x1, line_position_y), (box_x2, line_position_y), (0, 255, 255), 2)
 
-            # Draw a transparent background for text (rectangle with transparency)
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 120), (460, 385), (0, 0, 0), -1)  # Black rectangle
-            cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)  # Blend the overlay with the frame
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 120), (460, 385), (0, 0, 0), -1)
+        alpha = 0.5
+        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
-            # Display the result on the frame
-            y_offset = 140
-            cv2.putText(frame, f"Cars: {vehicle_counts['car']}", (10, 30 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f"Motorcycles: {vehicle_counts['motorcycle']}", (10, 70 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f"Buses: {vehicle_counts['bus']}", (10, 110 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f"Trucks: {vehicle_counts['truck']}", (10, 150 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f'Total Vehicles: {total_count}', (10, 190 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f'Total Persons: {persons}', (10, 230 + y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+        cv2.putText(frame, 'Car: {}'.format(vehicle_counts['car']), (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, 'Motorcycle: {}'.format(vehicle_counts['motorcycle']), (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, 'Bus: {}'.format(vehicle_counts['bus']), (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, 'Truck: {}'.format(vehicle_counts['truck']), (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, 'Total Vehicles: {}'.format(total_count), (10, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, 'Persons: {}'.format(persons), (10, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-            last_processed_frame = frame.copy()
-
-        if last_processed_frame is not None:
-            frame_to_show = last_processed_frame
-        else:
-            frame_to_show = frame
-
-        ret, buffer = cv2.imencode('.jpg', frame_to_show)
+        ret, buffer = cv2.imencode('.jpg', frame)
         frame = buffer.tobytes()
 
-        yield (b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        sleep_time = max(sleep_interval - elapsed_time, 0)
+        time.sleep(sleep_time)
 
 @app.route('/set_line_position/<monitoring_code>', methods=['POST'])
 def set_line_position(monitoring_code):
@@ -253,9 +320,12 @@ def set_line_position(monitoring_code):
 @app.route('/set_rtsp_url', methods=['POST'])
 def set_rtsp_url():
     rtsp_url = request.json.get('rtsp_url')
+
     if rtsp_url:
-        monitoring_code = camera.set_rtsp_url(rtsp_url)
-        if monitoring_code:
+        monitoring_code = generate_monitoring_code()  # Generate a new monitoring code
+
+        if camera.set_rtsp_url(rtsp_url):
+            monitoring_codes_data[monitoring_code] = monitoring_data
             return jsonify({'status': 'success', 'message': f'RTSP URL set to {rtsp_url}', 'monitoring_code': monitoring_code}), 200
         else:
             return jsonify({'status': 'error', 'message': 'Failed to set RTSP URL'}), 500
@@ -283,7 +353,7 @@ def monitoring(monitoring_code):
     if monitoring_code not in monitoring_codes_data:
         return jsonify({'status': 'error', 'message': 'Invalid monitoring code'}), 403
 
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(generate_frames(monitoring_code), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def index():
