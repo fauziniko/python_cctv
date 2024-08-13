@@ -10,7 +10,6 @@ python app.py
 
 docker build -t vehicle_detection_app .
 
-
 ## Menjalankan Container ##
 docker run -p 5000:5000 vehicle_detection_app
 
@@ -30,3 +29,6 @@ docker pull your_username/vehicle_detection_app:latest
 
 # Run the container
 docker run -p 5000:5000 your_username/vehicle_detection_app:latest
+
+# Convert model dari .onnx ke dalam .xml/.bin 
+mo --input_model model.onnx
